@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt::{self, Debug, Formatter};
 use std::io;
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -12,6 +13,12 @@ use std::time::{Duration, Instant};
 use libc::c_int as RawFd;
 
 use crate::Event;
+
+#[cfg(target_os = "espidf")]
+type NotifyType = u64;
+
+#[cfg(not(target_os = "espidf"))]
+type NotifyType = u8;
 
 /// Interface to poll.
 #[derive(Debug)]
@@ -27,6 +34,10 @@ pub struct Poller {
     /// Data is written to this to wake up the current instance of `wait`, which can occur when the
     /// user notifies it (in which case `notified` would have been set) or when an operation needs
     /// to occur (in which case `waiting_operations` would have been incremented).
+    ///
+    /// Note that on ESP-IDF, `notify_read` and `notify_write` are - in fact - the same file descriptor.
+    /// This is because the notification mechanism on that platform is implemented using the `eventfd`
+    /// syscall, rather than using the `pipe` syscall, which is not supported.
     notify_write: RawFd,
 
     /// The number of operations (`add`, `modify` or `delete`) that are currently waiting on the
@@ -84,15 +95,44 @@ impl Poller {
     pub fn new() -> io::Result<Poller> {
         // Create the notification pipe.
         let mut notify_pipe = [0; 2];
-        syscall!(pipe(notify_pipe.as_mut_ptr()))?;
 
-        // Put the reading side into non-blocking mode.
-        let notify_read_flags = syscall!(fcntl(notify_pipe[0], libc::F_GETFL))?;
-        syscall!(fcntl(
-            notify_pipe[0],
-            libc::F_SETFL,
-            notify_read_flags | libc::O_NONBLOCK
-        ))?;
+        // Note that the eventfd() implementation in ESP-IDF deviates from the specification in the following ways:
+        // 1) The file descriptor is always in a non-blocking mode, as if EFD_NONBLOCK was passed as a flag;
+        //    passing EFD_NONBLOCK or calling fcntl(.., F_GETFL/F_SETFL) on the eventfd() file descriptor is not supported
+        // 2) It always returns the counter value, even if it is 0. This is contrary to the specification which mandates
+        //    that it should instead fail with EAGAIN
+        //
+        // (1) is not a problem for us, as we want the eventfd() file descriptor to be in a non-blocking mode anyway
+        // (2) is also not a problem, as long as we don't try to read the counter value in an endless loop when we detect being notified
+        #[cfg(target_os = "espidf")]
+        {
+            extern "C" {
+                fn eventfd(initval: libc::c_uint, flags: libc::c_int) -> libc::c_int;
+            }
+
+            let fd = unsafe { eventfd(0, 0) };
+            if fd == -1 {
+                // TODO: Switch back to syscall! once eventfd is in libc for the ESP-IDF
+                return Err(std::io::ErrorKind::Other.into());
+            }
+
+            notify_pipe[0] = fd;
+            notify_pipe[1] = fd;
+        }
+
+        #[cfg(not(target_os = "espidf"))]
+        {
+            syscall!(pipe(notify_pipe.as_mut_ptr()))?;
+
+            // Put the reading side into non-blocking mode.
+            let notify_read_flags = syscall!(fcntl(notify_pipe[0], libc::F_GETFL))?;
+
+            syscall!(fcntl(
+                notify_pipe[0],
+                libc::F_SETFL,
+                notify_read_flags | libc::O_NONBLOCK
+            ))?;
+        }
 
         log::trace!(
             "new: notify_read={}, notify_write={}",
@@ -231,8 +271,16 @@ impl Poller {
 
             // Read all notifications.
             if notified {
-                while syscall!(read(self.notify_read, &mut [0; 64] as *mut _ as *mut _, 64)).is_ok()
-                {
+                if self.notify_read != self.notify_write {
+                    // When using the `pipe` syscall, we have to read all accumulated notifications in the pipe.
+                    while syscall!(read(self.notify_read, &mut [0; 64] as *mut _ as *mut _, 64))
+                        .is_ok()
+                    {}
+                } else {
+                    // When using the `eventfd` syscall, it is OK to read just once, so as to clear the counter.
+                    // In fact, reading in a loop will result in an endless loop on the ESP-IDF
+                    // which is not following the specification strictly.
+                    let _ = self.pop_notification();
                 }
             }
 
@@ -310,13 +358,21 @@ impl Poller {
 
     /// Wake the current thread that is calling `wait`.
     fn notify_inner(&self) -> io::Result<()> {
-        syscall!(write(self.notify_write, &0_u8 as *const _ as *const _, 1))?;
+        syscall!(write(
+            self.notify_write,
+            &(1 as NotifyType) as *const _ as *const _,
+            mem::size_of::<NotifyType>()
+        ))?;
         Ok(())
     }
 
     /// Remove a notification created by `notify_inner`.
     fn pop_notification(&self) -> io::Result<()> {
-        syscall!(read(self.notify_read, &mut [0; 1] as *mut _ as *mut _, 1))?;
+        syscall!(read(
+            self.notify_read,
+            &mut [0; mem::size_of::<NotifyType>()] as *mut _ as *mut _,
+            mem::size_of::<NotifyType>()
+        ))?;
         Ok(())
     }
 }
@@ -325,7 +381,10 @@ impl Drop for Poller {
     fn drop(&mut self) {
         log::trace!("drop: notify_read={}", self.notify_read);
         let _ = syscall!(close(self.notify_read));
-        let _ = syscall!(close(self.notify_write));
+
+        if self.notify_read != self.notify_write {
+            let _ = syscall!(close(self.notify_write));
+        }
     }
 }
 
